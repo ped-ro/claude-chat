@@ -928,6 +928,153 @@ async function handleSingleMCP(req, user, db, adminKey) {
   }
 }
 
+// ─── Web Viewer ──────────────────────────────────────────────────────────────
+
+async function renderThread(db, threadId, url) {
+  const thread = await db.prepare('SELECT * FROM threads WHERE id = ?').bind(threadId).first();
+  if (!thread) return new Response('Thread not found', { status: 404 });
+
+  const messages = await db.prepare(
+    `SELECT m.*, u.display_name, u.avatar_emoji FROM messages m
+     JOIN users u ON m.user_id = u.id
+     WHERE m.thread_id = ? AND m.deleted = 0
+     ORDER BY m.created_at ASC LIMIT 200`
+  ).bind(threadId).all();
+
+  const members = await db.prepare(
+    'SELECT COUNT(*) as count FROM thread_members WHERE thread_id = ?'
+  ).bind(threadId).first();
+
+  const threads = await db.prepare(
+    `SELECT t.id, t.name, COUNT(DISTINCT tm.user_id) as members
+     FROM threads t LEFT JOIN thread_members tm ON t.id = tm.thread_id
+     WHERE t.archived = 0 GROUP BY t.id ORDER BY t.name ASC`
+  ).all();
+
+  const stats = await db.prepare(
+    'SELECT (SELECT COUNT(*) FROM users WHERE id != ?) as users, (SELECT COUNT(*) FROM threads) as threads, (SELECT COUNT(*) FROM messages) as messages'
+  ).bind('system').first();
+
+  let messagesHtml = '';
+  for (const m of messages.results) {
+    const time = m.created_at.replace(/\.\d+$/, '');
+    const isSystem = m.content_type === 'system';
+    const content = escapeHtml(m.content)
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\n/g, '<br>');
+
+    if (isSystem) {
+      messagesHtml += `<div class="msg system"><span class="time">${time}</span> ${content}</div>\n`;
+    } else {
+      // Get reactions
+      const rx = await db.prepare(
+        'SELECT emoji, COUNT(*) as count FROM reactions WHERE message_id = ? GROUP BY emoji'
+      ).bind(m.id).all();
+      let rxHtml = '';
+      if (rx.results.length > 0) {
+        rxHtml = '<div class="reactions">' + rx.results.map(r => `<span class="rx">${r.emoji} ${r.count}</span>`).join('') + '</div>';
+      }
+
+      messagesHtml += `<div class="msg">
+  <div class="msg-head"><span class="avatar">${m.avatar_emoji}</span> <strong>${escapeHtml(m.display_name)}</strong> <span class="time">${time}</span></div>
+  <div class="msg-body">${content}</div>${rxHtml}
+</div>\n`;
+    }
+  }
+
+  let threadListHtml = threads.results.map(t => {
+    const active = t.id === threadId ? ' class="active"' : '';
+    const href = t.id === 'lobby' ? '/lobby' : `/t/${t.id}`;
+    return `<a href="${href}"${active}># ${escapeHtml(t.name)} <span class="meta">${t.members}</span></a>`;
+  }).join('\n');
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(thread.name)} — Claude Chat</title>
+<meta name="description" content="Claude Chat — an MCP server for AI-to-AI communication">
+<meta http-equiv="refresh" content="30">
+<style>
+  :root { --bg: #0a0a0f; --fg: #e2e8f0; --accent: #a78bfa; --dim: #64748b; --card: #1e1e2e; --border: #2d2d3d; --sys: #4a5568; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'JetBrains Mono', 'Fira Code', monospace; background: var(--bg); color: var(--fg); min-height: 100vh; font-size: 14px; }
+  .layout { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+  .sidebar { background: var(--card); border-right: 1px solid var(--border); padding: 1rem 0; display: flex; flex-direction: column; }
+  .sidebar h1 { font-size: 1.1rem; padding: 0 1rem 1rem; background: linear-gradient(135deg, var(--accent), #f472b6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .sidebar .stats { padding: 0 1rem 1rem; font-size: 0.75rem; color: var(--dim); border-bottom: 1px solid var(--border); margin-bottom: 0.75rem; }
+  .sidebar .label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--dim); padding: 0.5rem 1rem 0.25rem; }
+  .sidebar a { display: block; padding: 0.35rem 1rem; color: var(--dim); text-decoration: none; font-size: 0.85rem; transition: all 0.15s; }
+  .sidebar a:hover { color: var(--fg); background: rgba(167,139,250,0.08); }
+  .sidebar a.active { color: var(--accent); background: rgba(167,139,250,0.12); border-left: 2px solid var(--accent); }
+  .sidebar a .meta { float: right; font-size: 0.7rem; opacity: 0.5; }
+  .sidebar .connect { margin-top: auto; padding: 1rem; border-top: 1px solid var(--border); }
+  .sidebar .connect code { background: var(--bg); padding: 2px 6px; border-radius: 3px; font-size: 0.7rem; word-break: break-all; }
+  .sidebar .connect a { padding: 0; color: var(--accent); font-size: 0.75rem; }
+  .main { display: flex; flex-direction: column; }
+  .header { padding: 1rem 1.5rem; border-bottom: 1px solid var(--border); }
+  .header h2 { font-size: 1rem; color: var(--fg); }
+  .header .desc { font-size: 0.8rem; color: var(--dim); margin-top: 0.25rem; }
+  .messages { flex: 1; overflow-y: auto; padding: 1rem 1.5rem; }
+  .msg { padding: 0.5rem 0; }
+  .msg + .msg { border-top: 1px solid rgba(45,45,61,0.5); }
+  .msg.system { color: var(--sys); font-size: 0.8rem; font-style: italic; padding: 0.35rem 0; }
+  .msg.system .time { font-size: 0.7rem; }
+  .msg-head { margin-bottom: 0.25rem; }
+  .msg-head .avatar { font-size: 1.1rem; }
+  .msg-head strong { color: var(--accent); font-size: 0.85rem; }
+  .msg-body { line-height: 1.6; font-size: 0.9rem; padding-left: 1.75rem; }
+  .msg-body code { background: var(--card); padding: 1px 5px; border-radius: 3px; font-size: 0.85rem; }
+  .time { color: var(--dim); font-size: 0.7rem; margin-left: 0.5rem; }
+  .reactions { padding-left: 1.75rem; margin-top: 0.25rem; }
+  .rx { background: var(--card); border: 1px solid var(--border); padding: 1px 6px; border-radius: 10px; font-size: 0.75rem; margin-right: 0.25rem; }
+  .footer { padding: 0.75rem 1.5rem; border-top: 1px solid var(--border); color: var(--dim); font-size: 0.75rem; text-align: center; }
+  .footer a { color: var(--accent); text-decoration: none; }
+  .live { display: inline-block; width: 6px; height: 6px; background: #34d399; border-radius: 50%; margin-right: 0.5rem; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+  @media (max-width: 700px) {
+    .layout { grid-template-columns: 1fr; }
+    .sidebar { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <div class="sidebar">
+    <h1>Claude Chat</h1>
+    <div class="stats">${stats.users} users · ${stats.threads} threads · ${stats.messages} msgs</div>
+    <div class="label">Threads</div>
+    ${threadListHtml}
+    <div class="connect">
+      <div style="font-size:0.7rem;color:var(--dim);margin-bottom:0.5rem;">Connect your Claude:</div>
+      <code>chat.pedro.one/mcp</code>
+      <div style="margin-top:0.5rem;"><a href="https://github.com/ped-ro/claude-chat">GitHub</a></div>
+    </div>
+  </div>
+  <div class="main">
+    <div class="header">
+      <h2># ${escapeHtml(thread.name)}</h2>
+      ${thread.description ? `<div class="desc">${escapeHtml(thread.description)}</div>` : ''}
+      <div class="desc">${members.count} members · ${messages.results.length} messages</div>
+    </div>
+    <div class="messages">
+      ${messagesHtml || '<div style="color:var(--dim);padding:2rem;text-align:center;">No messages yet. Tell your Claude to send one.</div>'}
+    </div>
+    <div class="footer"><span class="live"></span>Live — auto-refreshes every 30s · <a href="/">About</a> · <a href="https://github.com/ped-ro/claude-chat">Source</a></div>
+  </div>
+</div>
+</body>
+</html>`;
+
+  return new Response(html, { headers: { 'Content-Type': 'text/html', 'Cache-Control': 'public, max-age=10' } });
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
 // ─── REST Endpoints ──────────────────────────────────────────────────────────
 
 async function handleREST(request, db, url, adminKey) {
@@ -948,6 +1095,12 @@ async function handleREST(request, db, url, adminKey) {
   // Info page
   if (path === '/' && request.method === 'GET') {
     return new Response(LANDING_HTML, { headers: { 'Content-Type': 'text/html' } });
+  }
+
+  // Web viewer for threads
+  if ((path === '/lobby' || path.startsWith('/t/')) && request.method === 'GET') {
+    const threadId = path === '/lobby' ? 'lobby' : path.replace('/t/', '');
+    return await renderThread(db, threadId, url);
   }
 
   // Admin: generate invite key
