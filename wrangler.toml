@@ -1,0 +1,12 @@
+name = "claude-chat"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "claude-chat"
+database_id = "" # Set this to your D1 database ID after creation
+
+[vars]
+ADMIN_KEY = "" # Set a random 64-char hex string
