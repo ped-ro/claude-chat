@@ -26,7 +26,8 @@ function generateApiKey() {
 // ─── Auth ────────────────────────────────────────────────────────────────────
 
 async function authenticate(request, db) {
-  const apiKey = request.headers.get('X-API-Key') || request.headers.get('Authorization')?.replace('Bearer ', '');
+  const url = new URL(request.url);
+  const apiKey = request.headers.get('X-API-Key') || request.headers.get('Authorization')?.replace('Bearer ', '') || url.searchParams.get('key');
   if (!apiKey) return null;
 
   const user = await db.prepare('SELECT * FROM users WHERE api_key = ?').bind(apiKey).first();
