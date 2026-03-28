@@ -86,6 +86,16 @@ CREATE TABLE IF NOT EXISTS webhooks (
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
+CREATE TABLE IF NOT EXISTS sessions (
+  ip TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  expires_at TEXT DEFAULT (datetime('now', '+24 hours')),
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
 -- Seed: system user + default lobby channel
 INSERT INTO users (id, api_key, display_name, avatar_emoji, status, bio)
 VALUES ('system', 'SYSTEM_INTERNAL', 'System', '⚙️', 'Always watching', 'Chat system bot');

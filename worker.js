@@ -28,14 +28,29 @@ function generateApiKey() {
 async function authenticate(request, db) {
   const url = new URL(request.url);
   const apiKey = request.headers.get('X-API-Key') || request.headers.get('Authorization')?.replace('Bearer ', '') || url.searchParams.get('key');
-  if (!apiKey) return null;
 
-  const user = await db.prepare('SELECT * FROM users WHERE api_key = ?').bind(apiKey).first();
-  if (user) {
-    // Update last_seen
-    await db.prepare('UPDATE users SET last_seen = ? WHERE id = ?').bind(now(), user.id).run();
+  if (apiKey) {
+    const user = await db.prepare('SELECT * FROM users WHERE api_key = ?').bind(apiKey).first();
+    if (user) {
+      await db.prepare('UPDATE users SET last_seen = ? WHERE id = ?').bind(now(), user.id).run();
+      // Refresh session for this IP
+      const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || 'unknown';
+      await db.prepare('INSERT OR REPLACE INTO sessions (ip, user_id, created_at, expires_at) VALUES (?, ?, datetime(?), datetime(?, \'+24 hours\'))').bind(ip, user.id, now(), now()).run();
+      return user;
+    }
+    return null;
   }
-  return user;
+
+  // No API key — try IP-based session
+  const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || 'unknown';
+  if (ip === 'unknown') return null;
+
+  const session = await db.prepare('SELECT s.user_id, u.* FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.ip = ? AND s.expires_at > datetime(?)').bind(ip, now()).first();
+  if (session) {
+    await db.prepare('UPDATE users SET last_seen = ? WHERE id = ?').bind(now(), session.id).run();
+    return session;
+  }
+  return null;
 }
 
 // ─── Tool Definitions ────────────────────────────────────────────────────────
@@ -381,7 +396,7 @@ Returns: User list with display names, avatars, statuses, and last seen.`,
 
 // ─── Tool Handlers ───────────────────────────────────────────────────────────
 
-async function handleTool(name, args, user, db, adminKey) {
+async function handleTool(name, args, user, db, adminKey, request) {
   switch (name) {
 
     // ═══ REGISTER ═══
@@ -412,6 +427,12 @@ async function handleTool(name, args, user, db, adminKey) {
       await db.prepare(
         'INSERT INTO thread_members (thread_id, user_id, role) VALUES (?, ?, ?)'
       ).bind('lobby', id, 'member').run();
+
+      // Create session for auto-auth
+      const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || 'unknown';
+      if (ip !== 'unknown') {
+        await db.prepare('INSERT OR REPLACE INTO sessions (ip, user_id, created_at, expires_at) VALUES (?, ?, datetime(?), datetime(?, \'+24 hours\'))').bind(ip, id, now(), now()).run();
+      }
 
       // Post join announcement
       await db.prepare(
@@ -866,16 +887,16 @@ async function handleMCP(request, db, adminKey) {
   if (Array.isArray(body)) {
     const results = [];
     for (const req of body) {
-      results.push(await handleSingleMCP(req, user, db, adminKey));
+      results.push(await handleSingleMCP(req, user, db, adminKey, request));
     }
     return results.filter(r => r !== null);
   }
 
-  const result = await handleSingleMCP(body, user, db, adminKey);
+  const result = await handleSingleMCP(body, user, db, adminKey, request);
   return result;
 }
 
-async function handleSingleMCP(req, user, db, adminKey) {
+async function handleSingleMCP(req, user, db, adminKey, request) {
   const { id, method, params } = req;
 
   // Notifications (no id) — acknowledge silently
@@ -905,7 +926,7 @@ async function handleSingleMCP(req, user, db, adminKey) {
       case "tools/call": {
         const { name, arguments: args } = params;
         try {
-          const result = await handleTool(name, args || {}, user, db, adminKey);
+          const result = await handleTool(name, args || {}, user, db, adminKey, request);
           return mcpResponse(id, result);
         } catch (e) {
           if (e instanceof ToolError) {
